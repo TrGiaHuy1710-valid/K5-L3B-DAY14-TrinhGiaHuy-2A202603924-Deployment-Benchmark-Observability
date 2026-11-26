@@ -7,7 +7,7 @@ Yêu cầu:
   • redis_healthy() dùng cho GET /ready: Redis không kết nối được → False
 """
 import redis
-
+from app.config import settings
 # r = None  # TODO: tạo client, vd redis.from_url(settings.redis_url, decode_responses=True)
 
 r = redis.from_url(
