@@ -19,7 +19,11 @@ def verify_api_key(api_key: Optional[str] = Security(api_key_header)) -> str:
     """Dependency cho FastAPI — dùng trong /ask: Depends(verify_api_key)."""
     expected = settings.agent_api_key
     # Thiếu key, sai key, hoặc server chưa cấu hình key → đều 401
-    if not api_key or not expected or not hmac.compare_digest(api_key, expected):
+    # So sánh dạng bytes: compare_digest(str, str) ném TypeError nếu chuỗi có ký tự
+    # non-ASCII (vd key gửi lên có dấu) → sẽ thành 500 thay vì 401.
+    if not api_key or not expected or not hmac.compare_digest(
+        api_key.encode("utf-8"), expected.encode("utf-8")
+    ):
         raise HTTPException(
             status_code=401,
             detail="Missing or invalid API key. Include header: X-API-Key: <key>",
