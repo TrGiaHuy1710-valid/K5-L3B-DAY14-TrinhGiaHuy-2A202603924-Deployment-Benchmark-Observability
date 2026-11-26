@@ -1,0 +1,478 @@
+# Day 14 Lab - Mission Answers
+
+> Môi trường chạy: Windows 11 + Docker Desktop 28.1.1 (engine dùng chung với WSL2 Ubuntu 22.04), Docker Compose v2.35.1, Python 3.11 (FastAPI 0.139, uvicorn 0.51 ở local).
+> Mọi output dưới đây là kết quả chạy thật ngày 2026-11-26.
+
+---
+
+## Part 1: Localhost vs Production
+
+### Exercise 1.1: Anti-patterns found
+
+File: `01-localhost-vs-production/develop/app.py`
+
+| # | Anti-pattern | Dòng | Hậu quả |
+|---|---|---|---|
+| 1 | **Hardcode secret**: `OPENAI_API_KEY = "sk-hardcoded-..."` | 17 | Push lên GitHub là lộ key; đổi key phải sửa code và deploy lại |
+| 2 | **Hardcode connection string có mật khẩu**: `DATABASE_URL = "postgresql://admin:password123@..."` | 18 | Lộ mật khẩu DB; trỏ cứng vào `localhost` nên lên cloud không kết nối được |
+| 3 | **Log ra secret**: `print(f"[DEBUG] Using key: {OPENAI_API_KEY}")` | 34 | Key nằm trong log, ai đọc được log là có key (đã thấy thật ở log Exercise 1.2) |
+| 4 | **Dùng `print()` thay vì logging có cấu trúc**, không có level, không có timestamp | 33, 34, 38 | Không lọc/tìm kiếm được trong log aggregator; không tắt được log debug ở production |
+| 5 | **Debug bật cứng**: `DEBUG = True`, `reload=True` | 21, 53 | Reloader theo dõi file, tốn tài nguyên và có thể restart giữa chừng ở production |
+| 6 | **Bind `host="localhost"`** | 51 | Trong container/cloud không nhận được kết nối từ bên ngoài (phải là `0.0.0.0`) |
+| 7 | **Port cứng `port=8000`**, không đọc biến `PORT` | 52 | Railway/Render cấp port qua `PORT` → app nghe sai cổng, healthcheck fail |
+| 8 | **Không có health check** (`/health`, `/ready`) | — | Platform không biết app còn sống/sẵn sàng để restart hay route traffic (thực tế `GET /health` → 404) |
+| 9 | **Không xử lý shutdown** (không lifespan, không bắt SIGTERM) | — | Khi platform tắt/redeploy, request đang chạy bị cắt ngang |
+| 10 | **Không có config management**: `MAX_TOKENS = 500` và các config khác rải trong code | 22 | Mỗi môi trường (dev/staging/prod) phải sửa code |
+
+### Exercise 1.2: Chạy basic version
+
+Bản develop nhận `question` qua **query string** (`def ask_agent(question: str)`), nên lệnh JSON trong `CODE_LAB.md` trả 422:
+
+```text
+$ curl -i -X POST "http://localhost:8000/ask?question=Hello"
+HTTP/1.1 200 OK
+{"answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+
+$ curl -i -X POST http://localhost:8000/ask -H "Content-Type: application/json" -d '{"question":"Hello"}'
+HTTP/1.1 422 Unprocessable Entity
+{"detail":[{"type":"missing","loc":["query","question"],"msg":"Field required","input":null}]}
+
+$ curl -i http://localhost:8000/health
+HTTP/1.1 404 Not Found
+```
+
+Log server — **secret bị in thẳng ra log**:
+
+```text
+INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [12304] using StatReload
+[DEBUG] Got question: Hello
+[DEBUG] Using key: sk-hardcoded-fake-key-never-do-this
+[DEBUG] Response: Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé.
+INFO:     127.0.0.1:52151 - "POST /ask?question=Hello HTTP/1.1" 200 OK
+```
+
+**Nhận xét:** app chạy được, nhưng chưa production-ready: lộ key trong log, chỉ nghe `localhost:8000`, chạy reloader, không có `/health`.
+
+### Exercise 1.3: Comparison table
+
+Bản production (`01-localhost-vs-production/production/`) chạy với `PORT=8010`:
+
+```text
+$ curl -i http://localhost:8010/health
+HTTP/1.1 200 OK
+{"status":"ok","uptime_seconds":3.2,"version":"1.0.0","environment":"development","timestamp":"2026-11-26T08:19:31.010533+00:00"}
+
+$ curl -i http://localhost:8010/ready
+HTTP/1.1 200 OK
+{"ready":true}
+
+$ curl -i -X POST http://localhost:8010/ask -H "Content-Type: application/json" -d '{"question":"Hello"}'
+HTTP/1.1 200 OK
+{"question":"Hello","answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic.","model":"gpt-4o-mini"}
+
+$ curl -i -X POST http://localhost:8010/ask -H "Content-Type: application/json" -d '{}'
+HTTP/1.1 422 Unprocessable Entity
+{"detail":"question field is required"}
+```
+
+| Feature | Develop | Production | Tại sao quan trọng? |
+|---|---|---|---|
+| **Config** | Hardcode trong code (dòng 17–22) | Đọc env qua `config.py` (dataclass + `os.getenv`), có `.env.example` | Cùng một code chạy được ở dev/staging/prod chỉ bằng đổi env; secret không bao giờ vào Git |
+| **Secrets** | Key nằm trong code và bị in ra log | Lấy từ env; `validate()` **fail fast** khi `ENVIRONMENT=production` mà thiếu `AGENT_API_KEY` (`config.py:43`) | Lộ key = mất tiền/bị lạm dụng; fail fast giúp phát hiện cấu hình thiếu ngay lúc start chứ không phải lúc có user |
+| **Health check** | Không có (`/health` → 404) | `/health` (liveness, `app.py:136`) + `/ready` (readiness, `app.py:153`) | Platform dùng `/health` để quyết định restart, load balancer dùng `/ready` để quyết định có gửi traffic vào không |
+| **Logging** | `print()` | `logging` với format JSON, không log secret, chỉ log độ dài câu hỏi | Log có cấu trúc thì parse/search/alert được trong Datadog, Loki; không log dữ liệu nhạy cảm |
+| **Shutdown** | Đột ngột | `lifespan` (startup/shutdown, `app.py:40`) + handler SIGTERM (`app.py:189`) | Khi redeploy/scale down, request đang xử lý được hoàn thành, connection được đóng sạch |
+| **Host / Port** | `localhost:8000` cứng | `HOST=0.0.0.0`, `PORT` từ env (`app.py:196–197`) | Container và cloud bắt buộc nghe `0.0.0.0` và đúng port platform cấp |
+| **Debug / reload** | `reload=True` luôn bật | `reload=settings.debug`, mặc định `false` | Reloader chỉ dành cho dev; ở production tốn tài nguyên và có thể restart bất ngờ |
+| **Input API** | Query string `?question=` | JSON body `{"question": ...}`, thiếu field → 422 | JSON body là chuẩn cho REST API, mở rộng thêm field (user_id, …) dễ hơn |
+| **CORS** | Không cấu hình | `ALLOWED_ORIGINS` từ env | Chỉ cho frontend được phép gọi API |
+
+**Hai điểm bản production vẫn chưa ổn (phát hiện khi chạy thử):**
+
+1. **Log JSON của app không hiện ra.** `config.py:45` gọi `logging.warning(...)` lúc import, trước khi `app.py:28` gọi `logging.basicConfig(...)`. Lần gọi `logging.warning` đầu tiên đã tự cấu hình root logger (level WARNING, format mặc định), nên `basicConfig` sau đó không còn tác dụng. Kết quả: log chỉ có `WARNING:root:OPENAI_API_KEY not set — using mock LLM`, các dòng `logger.info(...)` dạng JSON bị nuốt. Cách sửa: gọi `basicConfig(..., force=True)` hoặc cấu hình logging trước khi import `config`.
+2. **Body không phải JSON → 500.** Gọi `POST /ask?question=Hello` (body rỗng) thì `await request.json()` (`app.py:104`) ném `JSONDecodeError`, không được bắt nên trả `500 Internal Server Error`. Nên dùng Pydantic model cho body để FastAPI tự trả 422.
+
+---
+
+## Part 2: Docker
+
+### Exercise 2.1: Dockerfile questions
+
+File: `02-docker/develop/Dockerfile`
+
+1. **Base image:** `python:3.11` (dòng 8) — bản Python đầy đủ trên Debian, có sẵn compiler và nhiều thư viện hệ thống, nên rất nặng.
+2. **Working directory:** `/app` (dòng 11). Các lệnh `COPY`, `RUN`, `CMD` sau đó chạy tương đối với thư mục này.
+3. **Tại sao `COPY requirements.txt` trước `COPY app.py`:** Docker cache theo từng layer, layer nào thay đổi thì nó và mọi layer sau phải build lại. `requirements.txt` ít thay đổi, còn code thay đổi liên tục. Copy requirements + `pip install` trước (dòng 14, 17) thì khi chỉ sửa code, layer cài dependencies vẫn lấy từ cache, build chỉ mất vài giây thay vì cài lại toàn bộ package.
+4. **CMD vs ENTRYPOINT:**
+   - `CMD` là lệnh/tham số **mặc định**, bị ghi đè hoàn toàn khi chạy `docker run image <lệnh khác>`.
+   - `ENTRYPOINT` là lệnh **cố định** của container; tham số truyền vào `docker run image <args>` được nối vào sau ENTRYPOINT (chỉ đổi được bằng `--entrypoint`).
+   - Hay dùng kết hợp: `ENTRYPOINT ["uvicorn"]` + `CMD ["main:app", "--port", "8000"]` → CMD đóng vai tham số mặc định.
+   - Nên dùng exec form (`["python", "app.py"]`) để process là PID 1 và nhận được SIGTERM khi `docker stop`.
+
+### Exercise 2.2: Build và run
+
+Build **từ gốc repo** (Dockerfile `COPY` theo đường dẫn tính từ gốc):
+
+```text
+$ docker build -f 02-docker/develop/Dockerfile -t my-agent:develop .
+$ docker run -d --rm --name p2dev -p 8011:8000 my-agent:develop
+
+$ curl -i -X POST "http://localhost:8011/ask?question=What%20is%20Docker%3F"
+HTTP/1.1 200 OK
+{"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
+
+$ curl http://localhost:8011/health
+{"status":"ok","uptime_seconds":6.2,"container":true}
+
+$ docker exec p2dev whoami
+root
+```
+
+(App develop của Part 2 cũng nhận `question` qua query string. Container chạy bằng **root**.)
+
+### Exercise 2.3: Multi-stage build và image size comparison
+
+**Lỗi gặp khi build bản production và cách xử lý:**
+
+- Build từ trong `02-docker/production/` (`docker build -f Dockerfile .`) → lỗi `"/02-docker/production/requirements.txt": not found`, vì build context là thư mục con còn Dockerfile `COPY` theo đường dẫn từ gốc repo. Sửa: build từ gốc repo.
+- Bước `RUN apt-get update` lỗi `401 VG-AuthenticationRequired [IP: 10.140.122.12 9090]`: mạng đang dùng có gateway chặn HTTP, mà apt của `python:3.11-slim` (Debian trixie) tải qua `http://deb.debian.org`. Kiểm tra từ host: HTTP trả 302 (chuyển sang trang đăng nhập), HTTPS trả 200. Sửa: thêm `sed -i 's|http://|https://|g' /etc/apt/sources.list.d/debian.sources` trước `apt-get update` (`02-docker/production/Dockerfile:22`).
+
+**Stage 1 (`builder`, dòng 16–31):** từ `python:3.11-slim`, cài build tools (`gcc`, `libpq-dev`), rồi `pip install --user` vào `/root/.local`. Stage này chỉ để build, **không được ship**.
+
+**Stage 2 (`runtime`, dòng 38–74):** bắt đầu lại từ một `python:3.11-slim` sạch, tạo user `appuser` (non-root), **chỉ copy** thư mục package đã cài (`COPY --from=builder /root/.local ...`) và source code, chạy bằng `USER appuser`, có `HEALTHCHECK`, `CMD` dạng exec form chạy uvicorn 2 workers.
+
+**Tại sao image nhỏ hơn:**
+- Base `python:3.11-slim` (125.1 MB) thay vì `python:3.11` full: bỏ compiler, header, tài liệu, nhiều thư viện hệ thống.
+- `gcc`, `libpq-dev`, apt cache và pip cache chỉ nằm ở stage builder, bị bỏ lại; stage runtime chỉ nhận layer package 37.8 MB (đo bằng `docker history my-agent:advanced`).
+- Bonus bảo mật: chạy bằng `appuser`, image ít package hơn → ít lỗ hổng (CVE) hơn.
+
+```text
+$ docker build -f 02-docker/production/Dockerfile -t my-agent:advanced .
+$ docker images my-agent
+REPOSITORY   TAG        IMAGE ID       CREATED          SIZE
+my-agent     advanced   f41fac004990   3 minutes ago    163MB
+my-agent     develop    f6894c2f712a   17 minutes ago   1.15GB
+
+$ docker image inspect my-agent:develop  --format '{{.Size}}'   → 1154311927 bytes
+$ docker image inspect my-agent:advanced --format '{{.Size}}'   → 162882434 bytes
+```
+
+| Image | Size |
+|---|---:|
+| Develop (`python:3.11`, single-stage) | **1154.3 MB** |
+| Production (`python:3.11-slim`, multi-stage) | **162.9 MB** |
+| Chênh lệch | **giảm 85.9%** (nhỏ hơn ~7.1 lần) |
+
+Cách tính: `(1154.3 − 162.9) / 1154.3 = 85.9%`.
+
+Chạy container production:
+
+```text
+$ docker run -d --rm --name p2adv -p 8012:8000 my-agent:advanced
+$ curl -i -X POST http://localhost:8012/ask -H "Content-Type: application/json" -d '{"question":"What is Docker?"}'
+HTTP/1.1 200 OK
+{"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
+
+$ docker ps   → p2adv   Up 6 seconds (healthy)     ← HEALTHCHECK hoạt động
+$ docker exec p2adv whoami
+appuser
+```
+
+Nhận xét log: dòng `{"time":"...","level":"INFO","msg":"{"event": "request", "q_len": 15}"}` **không phải JSON hợp lệ**, vì `json.dumps(...)` được nhét vào trong `"msg":"%(message)s"` mà không escape dấu `"`. Muốn log JSON đúng chuẩn phải dùng formatter tự `json.dumps` cả record (sẽ làm ở Part 6).
+
+### Exercise 2.4: Docker Compose stack
+
+Chạy trong `02-docker/production/` (compose tự đặt `context: ../..`):
+
+```text
+$ touch .env.local
+$ docker compose -p k5-day14-docker up -d --build
+$ docker compose -p k5-day14-docker ps
+SERVICE   IMAGE                   STATUS                    PORTS
+agent     k5-day14-docker-agent   Up 15 seconds (healthy)   8000/tcp
+nginx     nginx:alpine            Up 15 seconds             0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp
+qdrant    qdrant/qdrant:v1.9.0    Up 26 seconds (healthy)   6333-6334/tcp
+redis     redis:7-alpine          Up 26 seconds (healthy)   6379/tcp
+```
+
+**Architecture diagram:**
+
+```text
+                    Host (máy của bạn)
+                         │  :80 / :443  (cổng DUY NHẤT được publish)
+                         ▼
+ ┌──────────────── network "internal" (bridge, 172.21.0.0/16) ────────────────┐
+ │                                                                            │
+ │   ┌──────────────────┐    proxy_pass       ┌──────────────────────────┐    │
+ │   │ nginx            │ ──────────────────► │ agent  (FastAPI, :8000)  │    │
+ │   │ 172.21.0.5       │  upstream           │ 172.21.0.4               │    │
+ │   │ reverse proxy,   │  agent_backend      │ uvicorn --workers 2      │    │
+ │   │ rate limit 10r/s,│  (round-robin)      │ user appuser, healthcheck│    │
+ │   │ security headers │                     └──────┬─────────────┬─────┘    │
+ │   └──────────────────┘          REDIS_URL         │             │ QDRANT_URL
+ │                          redis://redis:6379/0     ▼             ▼          │
+ │                              ┌────────────────────────┐ ┌───────────────┐  │
+ │                              │ redis (:6379)          │ │ qdrant (:6333)│  │
+ │                              │ 172.21.0.2             │ │ 172.21.0.3    │  │
+ │                              │ cache/session/ratelimit│ │ vector DB/RAG │  │
+ │                              │ volume redis_data      │ │ volume        │  │
+ │                              └────────────────────────┘ │ qdrant_data   │  │
+ │                                                         └───────────────┘  │
+ └────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Services và cách chúng giao tiếp:**
+- **4 service**: `nginx`, `agent`, `redis`, `qdrant`, cùng nằm trong network bridge `internal`. Các container gọi nhau bằng **tên service** nhờ DNS nội bộ của Docker (`agent:8000`, `redis:6379`, `qdrant:6333`).
+- Chỉ **nginx** publish cổng ra host (80/443). `agent`, `redis`, `qdrant` không publish cổng (`docker port k5-day14-docker-agent-1` không trả gì) → bên ngoài không gọi thẳng vào agent hay DB được.
+- **Thứ tự khởi động:** `agent` có `depends_on` với `condition: service_healthy` → đợi `redis` (`redis-cli ping`) và `qdrant` healthy rồi mới start (thấy rõ trong log `up`: redis/qdrant `Healthy` → agent `Started` → nginx `Started`).
+- Agent nhận địa chỉ Redis/Qdrant qua env (`REDIS_URL`, `QDRANT_URL`), secret đọc từ `.env.local` (nằm trong `.gitignore`).
+- Ghi chú: `main.py` của bài mẫu chưa thực sự dùng Redis/Qdrant (requirements chỉ có `fastapi`, `uvicorn`); hai service này minh hoạ kiến trúc đầy đủ. Part 6 mới dùng Redis thật cho rate limit và cost guard.
+
+**Test qua Nginx:**
+
+```text
+$ curl -i http://localhost/health
+HTTP/1.1 200 OK
+X-Frame-Options: DENY
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1; mode=block
+{"status":"ok","uptime_seconds":19.7,"version":"2.0.0","timestamp":"2026-11-26T08:21:47.664964"}
+
+$ curl -i http://localhost/ask -X POST -H "Content-Type: application/json" -d '{"question":"Explain microservices"}'
+HTTP/1.1 200 OK
+{"answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận."}
+```
+
+Các header `X-Frame-Options`, `X-Content-Type-Options`, `X-XSS-Protection` do Nginx thêm vào → chứng minh request đi qua Nginx rồi mới tới agent. Log agent cho thấy request đến từ IP của nginx (`172.21.0.5`), không phải từ host.
+
+Dọn stack: `docker compose -p k5-day14-docker down`.
+
+---
+
+## Part 3: Cloud Deployment
+
+_(làm ở CP6)_
+
+## Part 4: API Security
+
+### Exercise 4.1: API Key authentication (`04-api-gateway/develop/`)
+
+**API key được check ở đâu?**
+- Key đọc từ env: `API_KEY = os.getenv("AGENT_API_KEY", ...)` (`app.py:35`).
+- Header được khai báo bằng `APIKeyHeader(name="X-API-Key", auto_error=False)` (`app.py:36`).
+- Hàm dependency `verify_api_key` (`app.py:39`) được gắn vào endpoint bằng `Depends(verify_api_key)` (`app.py:70`). FastAPI chạy hàm này **trước** khi vào thân `/ask`, nên request không hợp lệ bị chặn trước khi tốn tiền gọi LLM. `/` và `/health` không gắn dependency nên vẫn public.
+
+**Sai key thì sao?**
+- Thiếu header → **401** `Missing API key` (`app.py:46`).
+- Có header nhưng sai key → **403** `Invalid API key.` (`app.py:51`).
+- Lưu ý: Part 6 yêu cầu cả thiếu lẫn sai key đều trả **401**, nên khi làm `06-lab-complete/app/auth.py` phải gộp hai trường hợp.
+
+**Rotate key thế nào?**
+- Key nằm trong env, không nằm trong code → đổi `AGENT_API_KEY` trên platform (Railway/Render Variables) rồi restart/redeploy, **không cần sửa code**.
+- Muốn rotate không downtime: cho phép nhiều key cùng lúc (ví dụ `AGENT_API_KEYS=old,new`). Phát key mới cho client, đợi tất cả chuyển sang, rồi bỏ key cũ khỏi danh sách.
+- So sánh nên dùng `hmac.compare_digest(api_key, API_KEY)` để tránh timing attack.
+
+**Test** (chạy `AGENT_API_KEY=secret-key-123 PORT=8013 python app.py`):
+
+```text
+$ curl -i -X POST http://localhost:8013/ask -H "Content-Type: application/json" -d '{"question": "Hello"}'
+HTTP/1.1 401 Unauthorized
+{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+
+$ curl -i -X POST http://localhost:8013/ask -H "X-API-Key: wrong-key" -H "Content-Type: application/json" -d '{"question": "Hello"}'
+HTTP/1.1 403 Forbidden
+{"detail":"Invalid API key."}
+
+$ curl -i -X POST http://localhost:8013/ask -H "X-API-Key: ***" -H "Content-Type: application/json" -d '{"question": "Hello"}'
+HTTP/1.1 200 OK
+{"question":"Hello","answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic."}
+
+$ curl -i http://localhost:8013/health
+HTTP/1.1 200 OK
+{"status":"ok"}
+```
+
+### Exercise 4.2: JWT authentication (`04-api-gateway/production/`)
+
+**JWT flow** (`auth.py`):
+1. Client gửi `POST /auth/token` với username/password → `authenticate_user` kiểm tra với `DEMO_USERS` (`auth.py:72`), sai → 401.
+2. Server tạo token bằng `create_token` (`auth.py:35`): payload `{sub, role, iat, exp}` (hết hạn sau 60 phút), ký bằng **HS256** với `JWT_SECRET` từ env (`auth.py:22`).
+3. Client gửi lại token ở header `Authorization: Bearer <token>` cho mỗi request.
+4. `verify_token` (`auth.py:46`) gọi `jwt.decode` (`auth.py:59`) để kiểm tra chữ ký và hạn dùng, rồi lấy `username`, `role` từ payload. **Không cần tra DB mỗi request** (stateless) → scale ngang dễ, instance nào cũng verify được nếu dùng chung secret.
+5. Lỗi: không có token → 401 (kèm `WWW-Authenticate: Bearer`); token hết hạn → 401; token giả/sai chữ ký → 403.
+
+Token chỉ được **ký**, không được **mã hoá**: ai cũng decode được payload (base64), nên không được để thông tin nhạy cảm trong payload. Đổi `JWT_SECRET` thì mọi token cũ mất hiệu lực ngay.
+
+**Test** (chạy `PORT=8014 python app.py`; tài khoản `admin/secret` trong `CODE_LAB.md` không tồn tại, dùng `student/demo123`):
+
+```text
+$ curl -i -X POST http://localhost:8014/auth/token -H "Content-Type: application/json" -d '{"username":"admin","password":"secret"}'
+HTTP/1.1 401 Unauthorized
+{"detail":"Invalid credentials"}
+
+$ curl -i -X POST http://localhost:8014/auth/token -H "Content-Type: application/json" -d '{"username":"student","password":"demo123"}'
+HTTP/1.1 200 OK
+{"access_token":"<TOKEN>","token_type":"bearer","expires_in_minutes":60,"hint":"Include in header: Authorization: Bearer <TOKEN>..."}
+
+# Decode token (3 phần header.payload.signature):
+header : {"alg":"HS256","typ":"JWT"}
+payload: {"sub":"student","role":"user","iat":1795682517,"exp":1795686117}     ← exp - iat = 3600 s
+
+$ curl -i -X POST http://localhost:8014/ask -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"question":"Explain JWT"}'
+HTTP/1.1 200 OK
+{"question":"Explain JWT","answer":"Đây là câu trả lời từ AI agent (mock). ...","usage":{"requests_remaining":9,"budget_remaining_usd":2.1e-05}}
+
+$ curl -i -X POST http://localhost:8014/ask -H "Content-Type: application/json" -d '{"question":"Explain JWT"}'
+HTTP/1.1 401 Unauthorized
+www-authenticate: Bearer
+{"detail":"Authentication required. Include: Authorization: Bearer <token>"}
+
+$ curl -i -X POST http://localhost:8014/ask -H "Authorization: Bearer abc.def.ghi" -H "Content-Type: application/json" -d '{"question":"Explain JWT"}'
+HTTP/1.1 403 Forbidden
+{"detail":"Invalid token."}
+
+$ curl -i -X POST http://localhost:8014/ask -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"question":""}'
+HTTP/1.1 422 Unprocessable Entity          ← Pydantic AskRequest: min_length=1, max_length=1000
+```
+
+Phân quyền theo role: `GET /admin/stats` với token `student` → `403 {"detail":"Admin only"}`; với token `teacher` (role admin) → 200.
+
+### Exercise 4.3: Rate limiting
+
+**Algorithm:** **Sliding window log** (file ghi là "Sliding Window Counter" nhưng thực chất lưu từng timestamp). Mỗi user có một `deque` timestamp (`rate_limiter.py:27`). Mỗi request:
+1. Xoá timestamp cũ hơn 60 giây khỏi đầu deque (`rate_limiter.py:39`).
+2. Nếu số timestamp còn lại `>= max_requests` → **429** kèm `Retry-After` = thời gian tới khi request cũ nhất rời cửa sổ (`rate_limiter.py:45`).
+3. Ngược lại thêm `now` vào deque (`rate_limiter.py:65`).
+
+So với fixed window: không bị lỗi "dồn 2x request ở ranh giới phút". So với token bucket: không cho burst, đơn giản hơn nhưng tốn bộ nhớ O(số request) mỗi user.
+
+**Limit:** user thường **10 request/phút**; admin **100 request/phút** (`rate_limiter.py:86-87`).
+
+**Bypass cho admin:** không bypass hoàn toàn mà chọn limiter theo role trong JWT: `limiter = rate_limiter_admin if role == "admin" else rate_limiter_user` (`app.py:141`). Muốn bypass hẳn thì `if role == "admin": skip check`, nhưng không nên, vì token admin bị lộ thì không còn lớp nào chặn.
+
+**Hạn chế:** state nằm trong RAM của process → chạy nhiều instance thì mỗi instance đếm riêng (user được 10 × N request/phút), restart là mất. Production phải dùng Redis (Part 6: sorted set `ZREMRANGEBYSCORE → ZCARD → ZADD → EXPIRE`).
+
+**Test** (vòng lặp 20 request bằng token `student`, sau 1 request ở 4.2):
+
+```text
+$ for i in $(seq 1 20); do curl -i -X POST http://localhost:8014/ask -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" -d "{\"question\": \"Test $i\"}"; done
+
+req  1: HTTP/1.1 200 OK  ... "usage":{"requests_remaining":8, ...}
+req  2: HTTP/1.1 200 OK  ... "usage":{"requests_remaining":7, ...}
+req  3: HTTP/1.1 200 OK  ... "usage":{"requests_remaining":6, ...}
+req  4: HTTP/1.1 200 OK  ... "usage":{"requests_remaining":5, ...}
+req  5: HTTP/1.1 200 OK  ... "usage":{"requests_remaining":4, ...}
+req  6: HTTP/1.1 200 OK  ... "usage":{"requests_remaining":3, ...}
+req  7: HTTP/1.1 200 OK  ... "usage":{"requests_remaining":2, ...}
+req  8: HTTP/1.1 200 OK  ... "usage":{"requests_remaining":1, ...}
+req  9: HTTP/1.1 200 OK  ... "usage":{"requests_remaining":0, ...}
+req 10: HTTP/1.1 429 Too Many Requests
+        x-ratelimit-limit: 10
+        x-ratelimit-remaining: 0
+        x-ratelimit-reset: 1795682583
+        retry-after: 56
+        {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":56}}
+req 11: HTTP/1.1 429 Too Many Requests  retry-after: 55  ...
+...
+req 20: HTTP/1.1 429 Too Many Requests  retry-after: 52  ...
+```
+
+→ Đúng 10 request thành công trong 60 giây (1 ở bước 4.2 + 9 trong vòng lặp), request thứ 11 bị **429**. `Retry-After` giảm dần (56 → 52) vì cửa sổ trượt theo thời gian.
+
+Token `teacher` (admin) gửi 12 request liên tiếp → cả 12 đều `200`, request thứ 13 trả `"requests_remaining":87` (limit 100).
+
+### Exercise 4.4: Cost guard
+
+**Bản có sẵn (`production/cost_guard.py`):**
+- Budget theo **ngày**: $1/user, $10 toàn hệ thống (`cost_guard.py:128`).
+- `check_budget` được gọi **trước** khi gọi LLM (`app.py:145`): user vượt → **402 Payment Required** (`cost_guard.py:78`); tổng hệ thống vượt → **503** (`cost_guard.py:71`). `record_usage` gọi **sau** khi có response để cộng chi phí thật theo token (`app.py:153`).
+- State trong dict RAM (`cost_guard.py:49`) → mất khi restart, không chia sẻ giữa instance.
+- **Bug phát hiện khi test:** response `/ask` trả `"budget_remaining_usd": usage.total_cost_usd` (`app.py:160`) — đây là số **đã tiêu**, không phải số còn lại. Sau 10 request, `/ask` báo `0.000184` trong khi `/me/usage` báo đúng `budget_remaining_usd: 0.999816`:
+
+```text
+$ curl http://localhost:8014/me/usage -H "Authorization: Bearer $TOKEN"
+{"user_id":"student","date":"2026-11-26","requests":10,"input_tokens":40,"output_tokens":296,
+ "cost_usd":0.000184,"budget_usd":1.0,"budget_remaining_usd":0.999816,"budget_used_pct":0.0}
+```
+
+Với mock LLM, 10 request chỉ tốn $0.000184 (~$0.0000184/request) → cần ~54.000 request mới chạm $1, trong khi rate limit chỉ cho 10 request/phút (~90 giờ). Vì vậy không thể thấy 402 qua HTTP với bản demo; mình kiểm tra 402 bằng bản Redis tự viết bên dưới.
+
+**Bản tự implement với Redis** — [`04-api-gateway/production/cost_guard_redis.py`](04-api-gateway/production/cost_guard_redis.py), theo đề: $10/tháng/user, lưu Redis, reset đầu tháng.
+
+```python
+_RESERVE_SCRIPT = r.register_script("""
+    local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+    local cost = tonumber(ARGV[1])
+    local budget = tonumber(ARGV[2])
+    if current + cost > budget then
+        return 0
+    end
+    redis.call('INCRBYFLOAT', KEYS[1], ARGV[1])
+    redis.call('EXPIRE', KEYS[1], ARGV[3])
+    return 1
+""")
+
+def month_key(user_id, now=None):
+    now = now or datetime.now(timezone.utc)
+    return f"budget:{user_id}:{now:%Y-%m}"
+
+def check_budget(user_id: str, estimated_cost: float) -> bool:
+    return bool(_RESERVE_SCRIPT(keys=[month_key(user_id)],
+                                args=[estimated_cost, MONTHLY_BUDGET_USD, KEY_TTL_SECONDS]))
+```
+
+Cách làm:
+- **Key theo tháng UTC** `budget:<user>:<YYYY-MM>` → sang tháng mới là key mới, tự reset mà không cần cron job.
+- **TTL 32 ngày** → key tháng cũ tự bị Redis xoá.
+- **Kiểm tra + cộng tiền trong một Lua script → atomic.** Lời giải mẫu trong `CODE_LAB.md` làm `GET` rồi mới `INCRBYFLOAT` (hai lệnh riêng) nên có race condition: nhiều request đồng thời cùng đọc số dư cũ và cùng qua, làm vượt budget. Redis chạy Lua script nguyên khối, không request nào chen vào giữa.
+- Dùng `>` chứ không `>=`: tiêu đúng bằng $10 vẫn được phép.
+- Budget đọc từ env `MONTHLY_BUDGET_USD`, Redis từ `REDIS_URL`.
+- Trong endpoint: `if not check_budget(user, est_cost): raise HTTPException(402, ...)`.
+
+**Test** ([`test_cost_guard_redis.py`](04-api-gateway/production/test_cost_guard_redis.py), Redis tạm `docker run -d --rm --name p4-redis -p 6380:6379 redis:7-alpine`):
+
+```text
+$ REDIS_URL=redis://localhost:6380/0 python test_cost_guard_redis.py
+Budget: $10.0/tháng, key: budget:alice:2026-11
+
+[1] alice tiêu dần:
+  spent=$ 0.00 + $3.00 → OK    spent sau=$3.00
+  spent=$ 3.00 + $3.00 → OK    spent sau=$6.00
+  spent=$ 6.00 + $3.00 → OK    spent sau=$9.00
+  spent=$ 9.00 + $3.00 → DENY (→ 402)  spent sau=$9.00
+  spent=$ 9.00 + $1.00 → OK    spent sau=$10.00
+  spent=$10.00 + $0.01 → DENY (→ 402)  spent sau=$10.00
+
+[2] bob (budget riêng): check $5 → True, spent=$5.0
+
+[3] TTL key alice: 2764800 giây (~32 ngày)
+
+[4] Key tháng sau: budget:alice:2026-12 (chưa tồn tại → spent=0: True)
+
+[5] 50 request đồng thời x $0.5: OK=20, DENY=30, spent=$10.00 (không vượt $10.0)
+```
+
+Kết quả [5] chứng minh tính atomic: 50 request song song, đúng 20 × $0.5 = $10 được qua, không request nào lọt khi đã hết budget.
+
+**Vì sao cần cả rate limit lẫn cost guard:**
+- **Rate limit bảo vệ tốc độ / tài nguyên** (chống spam, DoS, một user chiếm hết server) — đơn vị là *số request / thời gian*.
+- **Cost guard bảo vệ tiền** — đơn vị là *USD*. Một request có thể rẻ (câu ngắn) hoặc rất đắt (prompt dài, nhiều token output); 10 request/phút với prompt dài vẫn có thể đốt hàng chục USD/ngày. Ngược lại cost guard một mình không chặn được spam request rẻ làm quá tải server.
+- Thứ tự trong `/ask`: auth → rate limit → cost guard → gọi LLM → ghi chi phí. Chặn càng sớm càng đỡ tốn.
+
+## Part 5: Scaling & Reliability
+
+_(làm ở CP4)_
+
+---
+
+## AI log
+
+| # | Hỏi AI (Claude Code) | Nhận được | Tự kiểm tra |
+|---|---|---|---|
+| 1 | Tổng quan dự án và lộ trình làm bài | Tóm tắt các Part, checkpoint, rubric | Đối chiếu với `README.md`, `CHECKPOINTS.md`, `RUBRIC.md` |
+| 2 | Bản production Part 1 bị lỗi khi gọi `/ask` | Nguyên nhân: gọi bằng query string trong khi bản production đọc JSON body → `JSONDecodeError` → 500 | Chạy lại cả hai cách gọi, xem traceback trong log server |
+| 3 | `docker build` Part 2 lỗi ở bước `apt-get update` | Nguyên nhân: gateway mạng chặn HTTP (`401 VG-AuthenticationRequired`); đề xuất đổi apt sang HTTPS bằng `sed` | So sánh `curl` HTTP (302) và HTTPS (200), build lại thành công |
+| 4 | Ghi CP1, CP2 vào `MISSION_ANSWERS.md` | AI chạy các lệnh test và đo image, rồi soạn câu trả lời | Đọc lại từng câu trả lời, đối chiếu số dòng code và output lệnh |
+| 5 | Làm CP3 (Part 4: API key, JWT, rate limit, cost guard) | AI chạy test 401/403/200/429, phát hiện bug `budget_remaining_usd`, viết `cost_guard_redis.py` (Lua script atomic) + `test_cost_guard_redis.py` | Chạy lại vòng lặp curl thấy 429; chạy test Redis, kiểm tra kết quả 50 request đồng thời không vượt budget |
