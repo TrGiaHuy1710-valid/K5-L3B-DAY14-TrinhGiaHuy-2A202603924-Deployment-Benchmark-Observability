@@ -18,7 +18,9 @@ FROM python:3.11-slim AS builder
 WORKDIR /app
 
 # Cài build dependencies (cần cho một số packages như numpy)
-RUN apt-get update && apt-get install -y \
+# Đổi apt sang HTTPS: mạng hiện tại chặn HTTP (401 VG-AuthenticationRequired)
+RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y \
     gcc \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
